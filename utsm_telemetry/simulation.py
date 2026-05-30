@@ -22,7 +22,7 @@ DEFAULT_MOTOR_PROFILE = {
     "drivetrain_efficiency": 0.82,
     "corner_drag_factor": 0.1,
     "cd_area_m2": 0.0,  # Drag coefficient × frontal area (CdA)
-    "air_density_kg_m3": 1.225,  # Standard sea-level air density
+    "air_density_kg_m3": 1.225,  
 }
 
 def build_full_run_distance(df: pd.DataFrame) -> pd.DataFrame:
