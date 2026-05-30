@@ -44,8 +44,8 @@ def classify_strategy_action(delta_kph: float, hold_delta_kph: float = 1.0) -> s
 
 def build_motor_config(
     wheel_diameter_m: float = 0.50,
-    vehicle_mass_kg: float = 100.0,
-    driver_mass_kg: float = 0.0,
+    vehicle_mass_kg: float = 50.0,
+    driver_mass_kg: float = 50.0,
     rolling_resistance_coeff: float = 0.008,
     drivetrain_efficiency: float = 0.82,
     corner_drag_factor: float = 0.1,
