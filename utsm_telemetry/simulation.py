@@ -17,11 +17,11 @@ DEFAULT_MOTOR_PROFILE = {
     "top_speed_kph": 39.0,
     "wheel_diameter_m": 0.50,
     "vehicle_mass_kg": 100.0,
-    "driver_mass_kg": 0.0,
+    "driver_mass_kg": 50.0,
     "rolling_resistance_coeff": 0.008,
     "drivetrain_efficiency": 0.82,
     "corner_drag_factor": 0.1,
-    "cd_area_m2": 0.0,  # Drag coefficient × frontal area (CdA)
+    "cd_area_m2": 0.07235,  # Drag coefficient × frontal area (CdA)
     "air_density_kg_m3": 1.225,  
 }
 
@@ -49,7 +49,7 @@ def build_motor_config(
     rolling_resistance_coeff: float = 0.008,
     drivetrain_efficiency: float = 0.82,
     corner_drag_factor: float = 0.1,
-    cd_area_m2: float = 0.0,
+    cd_area_m2: float = 0.07235,
     air_density_kg_m3: float = 1.225,
 ) -> dict[str, float | str]:
     """Build motor configuration with optional aerodynamic drag parameters.
