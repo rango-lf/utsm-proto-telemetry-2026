@@ -460,6 +460,44 @@ def compute_energy(
 # Coordinate helpers
 # ---------------------------------------------------------------------------
 
+_EARTH_RADIUS_KM = 6371.0  # Mean Earth radius in km
+
+
+def haversine_distance(
+    lat1: "np.ndarray | pd.Series | float",
+    lon1: "np.ndarray | pd.Series | float",
+    lat2: "np.ndarray | pd.Series | float",
+    lon2: "np.ndarray | pd.Series | float",
+) -> "np.ndarray | float":
+    """Return the great-circle distance(s) in km between two GPS points.
+
+    Uses the Haversine formula, which is accurate to within ~0.5% for the
+    short inter-sample distances typical of a race track.
+
+    Parameters
+    ----------
+    lat1, lon1 : latitude / longitude of point 1 in decimal degrees.
+    lat2, lon2 : latitude / longitude of point 2 in decimal degrees.
+
+    Returns
+    -------
+    Distance in km (same shape as the inputs).
+    """
+    lat1_r = np.asarray(lat1, dtype=float) / 180.0 * np.pi
+    lat2_r = np.asarray(lat2, dtype=float) / 180.0 * np.pi
+    lon1_r = np.asarray(lon1, dtype=float) / 180.0 * np.pi
+    lon2_r = np.asarray(lon2, dtype=float) / 180.0 * np.pi
+
+    dlat = lat2_r - lat1_r
+    dlon = lon2_r - lon1_r
+
+    a = (
+        np.sin(dlat / 2) ** 2
+        + np.cos(lat1_r) * np.cos(lat2_r) * np.sin(dlon / 2) ** 2
+    )
+    return 2.0 * _EARTH_RADIUS_KM * np.arcsin(np.sqrt(a))
+
+
 def add_xy(df: pd.DataFrame) -> pd.DataFrame:
     """Add local flat-earth X/Y columns (metres) to a GPS DataFrame."""
     lat0 = df["lat"].iloc[0]
@@ -474,11 +512,13 @@ def add_xy(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_distance(df: pd.DataFrame) -> float:
-    """Total track distance in metres using flat-earth XY."""
-    coords = add_xy(df)[["x", "y"]].to_numpy()
-    if len(coords) < 2:
+    """Total track distance in metres using the Haversine formula."""
+    if len(df) < 2:
         return 0.0
-    return float(np.linalg.norm(coords[1:] - coords[:-1], axis=1).sum())
+    lat = df["lat"].to_numpy(dtype=float)
+    lon = df["lon"].to_numpy(dtype=float)
+    seg_km = haversine_distance(lat[:-1], lon[:-1], lat[1:], lon[1:])
+    return float(seg_km.sum() * 1000.0)
 
 
 def add_gps_motion_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -494,10 +534,11 @@ def add_gps_motion_features(df: pd.DataFrame) -> pd.DataFrame:
     df["gps_time"] = times
     df["gps_dt_s"] = times.diff().dt.total_seconds().fillna(0.0).clip(lower=0)
 
-    xy = df[["x", "y"]].to_numpy()
-    seg = np.zeros(len(xy))
-    if len(xy) > 1:
-        seg[1:] = np.linalg.norm(xy[1:] - xy[:-1], axis=1)
+    lat = df["lat"].to_numpy(dtype=float)
+    lon = df["lon"].to_numpy(dtype=float)
+    seg = np.zeros(len(df))
+    if len(df) > 1:
+        seg[1:] = haversine_distance(lat[:-1], lon[:-1], lat[1:], lon[1:]) * 1000.0
     df["gps_dist_m"] = seg
     df["gps_cumdist_m"] = df["gps_dist_m"].cumsum()
     df["gps_speed_m_s_raw"] = np.where(
@@ -1120,10 +1161,12 @@ def derive_motion_energy(
         smooth_window_s=accel_smooth_window_sec,
     )
 
-    # Point-to-point distance
-    xy = df[["x", "y"]].to_numpy()
-    seg = np.zeros(len(xy))
-    seg[1:] = np.linalg.norm(xy[1:] - xy[:-1], axis=1)
+    # Point-to-point distance via Haversine (great-circle, km → m)
+    lat = df["lat"].to_numpy(dtype=float)
+    lon = df["lon"].to_numpy(dtype=float)
+    seg = np.zeros(len(df))
+    if len(df) > 1:
+        seg[1:] = haversine_distance(lat[:-1], lon[:-1], lat[1:], lon[1:]) * 1000.0
     df["dist_m"] = seg
 
     # Elevation change
