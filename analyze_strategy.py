@@ -32,11 +32,15 @@ if _SCRIPT_DIR not in sys.path:
 
 from utsm_telemetry import (
     FORWARD_AXIS_CHOICES,
+    apply_kalman_filter,
     build_laps,
+    clean_telemetry,
+    compute_energy,
     derive_motion_energy,
     merge_by_time,
     read_gpx,
     read_telemetry,
+    reindex_to_distance,
 )
 
 
@@ -88,6 +92,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--imu-axis-sign", type=int, choices=[-1, 1], default=1)
     parser.add_argument("--accel-bias-window-sec", type=float, default=30.0)
     parser.add_argument("--accel-smooth-window-sec", type=float, default=8.0)
+    # ── V2 pre-processing flags ──────────────────────────────────────────────
+    parser.add_argument(
+        "--no-clean",
+        dest="clean",
+        action="store_false",
+        default=True,
+        help="Disable V2 telemetry cleaning (spike removal, gap filling).",
+    )
+    parser.add_argument(
+        "--no-kalman",
+        dest="kalman",
+        action="store_false",
+        default=True,
+        help="Disable Kalman filter fusion of GPS + IMU speed/position.",
+    )
+    parser.add_argument(
+        "--dist-step-m",
+        type=float,
+        default=1.0,
+        help="Grid spacing (m) for distance-domain reindexing (default: 1.0).",
+    )
     parser.add_argument(
         "--output-prefix", default="outputs/strategy",
         help="Prefix for output CSV and report files",
@@ -320,6 +345,11 @@ def main() -> int:
     print(f"Reading telemetry: {args.telemetry}")
     telem_df = read_telemetry(args.telemetry)
 
+    # ── V2 Step 1: clean spikes and fill gaps ─────────────────────────────────
+    if args.clean:
+        print("V2 Step 1: Cleaning telemetry (spikes, gaps)...")
+        telem_df = clean_telemetry(telem_df)
+
     print("Building laps...")
     gps_laps, telem_laps, _telem_aligned = build_laps(
         gps_df,
@@ -357,6 +387,25 @@ def main() -> int:
             accel_bias_window_sec=args.accel_bias_window_sec,
             accel_smooth_window_sec=args.accel_smooth_window_sec,
         )
+
+        # ── V2 Step 2: Kalman filter (GPS + IMU → clean speed/position) ──────
+        if args.kalman:
+            derived = apply_kalman_filter(
+                derived,
+                imu_axis=args.imu_axis,
+                imu_axis_sign=args.imu_axis_sign,
+                accel_scale=args.accel_scale,
+            )
+
+        # ── V2 Step 3: recompute energy using KF speed ────────────────────────
+        derived = compute_energy(derived, use_kf_speed=args.kalman)
+
+        # ── V2 Step 4: reindex to distance domain ─────────────────────────────
+        dist_col = "kf_cumdist_m" if (args.kalman and "kf_cumdist_m" in derived.columns) else "cumdist_m"
+        derived_dist = reindex_to_distance(derived, dist_col=dist_col, step_m=args.dist_step_m)
+        dist_csv = args.output_prefix + f"_lap{idx}_distgrid.csv"
+        derived_dist.to_csv(dist_csv, index=False)
+
         all_derived.append(derived)
 
         lap_row = build_lap_summary(derived, idx)
@@ -390,6 +439,7 @@ def main() -> int:
     sectors_df.to_csv(sectors_csv, index=False)
     speed_bins_df.to_csv(bins_csv, index=False)
     print(f"Wrote: {laps_csv}, {sectors_csv}, {bins_csv}")
+    print(f"  (per-lap distance-grid CSVs written alongside output prefix)")
 
     report = generate_findings(laps_df, sectors_df, speed_bins_df)
     with open(report_txt, "w") as fh:
