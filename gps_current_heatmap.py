@@ -7,8 +7,6 @@ python gps_current_heatmap.py Utsm.gpx telemetry_dumps/telemetry_20260411_112302
 
 Produces one PNG per lap, colour-coded by current, acceleration, or
 acceleration magnitude.
-
-Hello
 """
 
 from __future__ import annotations

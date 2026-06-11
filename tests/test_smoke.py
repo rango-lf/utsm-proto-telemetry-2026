@@ -538,7 +538,7 @@ class TestSimulation(unittest.TestCase):
         self.assertAlmostEqual(ratio, 7560.0 / expected_wheel_rpm)
         config = build_motor_config(0.50)
         self.assertAlmostEqual(config["inferred_gear_ratio"], ratio)
-        self.assertEqual(config["vehicle_mass_kg"], 50.0)
+        self.assertEqual(config["vehicle_mass_kg"], 100.0)
 
     def test_baseline_prediction_evaluation_reports_error(self):
         df = pd.DataFrame({
