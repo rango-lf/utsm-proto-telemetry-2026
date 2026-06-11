@@ -113,8 +113,390 @@ def read_telemetry(telemetry_path: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Pre-processing  (V2)
+# ---------------------------------------------------------------------------
+
+def clean_telemetry(
+    df: pd.DataFrame,
+    *,
+    current_max_mA: float = 60_000.0,
+    voltage_min_mV: float = 18_000.0,
+    voltage_max_mV: float = 30_000.0,
+    imu_spike_zscore: float = 5.0,
+    gap_fill_method: str = "linear",
+) -> pd.DataFrame:
+    """Clean raw telemetry: remove spikes and fill gaps.
+    """
+    df = df.copy().sort_values("timestamp_ms").reset_index(drop=True)
+    log: dict[str, int] = {}
+
+    # 1. Duplicate timestamps
+    n_before = len(df)
+    df = df.drop_duplicates(subset=["timestamp_ms"], keep="last").reset_index(drop=True)
+    log["duplicate_rows_removed"] = n_before - len(df)
+
+    sensor_cols = [c for c in ("current_mA", "voltage_mV", "ax_x100", "ay_x100", "az_x100", "amag_x100") if c in df.columns]
+
+    # 2. Current spikes
+    cur = pd.to_numeric(df["current_mA"], errors="coerce")
+    spike_cur = cur.abs() > current_max_mA
+    df.loc[spike_cur, "current_mA"] = np.nan
+    log["current_spikes_nulled"] = int(spike_cur.sum())
+
+    # 3. Voltage outliers
+    volt = pd.to_numeric(df["voltage_mV"], errors="coerce")
+    bad_volt = (volt < voltage_min_mV) | (volt > voltage_max_mV)
+    df.loc[bad_volt, "voltage_mV"] = np.nan
+    log["voltage_outliers_nulled"] = int(bad_volt.sum())
+
+    # 4. IMU spike rejection (z-score per axis)
+    imu_axes = [c for c in ("ax_x100", "ay_x100", "az_x100") if c in df.columns]
+    imu_total = 0
+    for col in imu_axes:
+        s = pd.to_numeric(df[col], errors="coerce")
+        std = s.std(skipna=True)
+        if std and std > 0:
+            z = (s - s.mean(skipna=True)) / std
+            spikes = z.abs() > imu_spike_zscore
+            df.loc[spikes, col] = np.nan
+            imu_total += int(spikes.sum())
+    log["imu_spikes_nulled"] = imu_total
+
+    # 5. Fill all NaN sensor values (never touch timestamp_ms)
+    for col in sensor_cols:
+        if df[col].isna().any():
+            if gap_fill_method == "ffill":
+                df[col] = df[col].ffill().bfill()
+            else:
+                df[col] = df[col].interpolate(method="linear", limit_direction="both")
+    log["total_rows_after_clean"] = len(df)
+
+    n_removed = n_before - len(df)
+    parts = []
+    if log["duplicate_rows_removed"]:
+        parts.append(f"{log['duplicate_rows_removed']} duplicate rows")
+    if log["current_spikes_nulled"]:
+        parts.append(f"{log['current_spikes_nulled']} current spikes")
+    if log["voltage_outliers_nulled"]:
+        parts.append(f"{log['voltage_outliers_nulled']} voltage outliers")
+    if log["imu_spikes_nulled"]:
+        parts.append(f"{log['imu_spikes_nulled']} IMU spikes")
+    if parts:
+        print(f"  [clean_telemetry] Fixed: {', '.join(parts)}.")
+    else:
+        print("  [clean_telemetry] No issues found.")
+
+    df.attrs["clean_log"] = log
+    return df
+
+
+def apply_kalman_filter(
+    df: pd.DataFrame,
+    *,
+    imu_axis: str = "ax",
+    imu_axis_sign: int = 1,
+    accel_scale: float = 1000.0,
+    gps_speed_noise: float = 0.3,
+    imu_accel_noise: float = 0.15,
+    process_noise: float = 0.05,
+) -> pd.DataFrame:
+    """Fuse GPS speed + IMU acceleration into a single clean speed / position
+    estimate using a 1-D constant-acceleration Kalman filter.
+
+    State vector: [position_m, velocity_m_s]
+
+    Sensor inputs
+    -------------
+    * GPS speed (``gps_speed_m_s``) — low noise but coarse 1 Hz updates.
+    * IMU forward dynamic acceleration (``imu_{imu_axis}_dynamic_smooth_m_s2``)
+      — high rate (~20 Hz) but drifts and has sensor noise.
+
+    The filter runs in real-time order (sorted by ``time``).  At each step:
+
+    * **Predict** — advance state with IMU acceleration over ``dt_s``.
+    * **Update with GPS** — whenever a GPS speed observation is available
+      (i.e. the row has a fresh GPS timestamp).
+
+    Outputs added
+    -------------
+    ``kf_speed_m_s``          — fused speed (m/s)
+    ``kf_speed_kph``          — fused speed (km/h)
+    ``kf_accel_m_s2``         — smoothed acceleration derived from KF state
+    ``kf_dist_m``             — per-row distance increment from KF velocity
+    ``kf_cumdist_m``          — cumulative distance from KF (within the lap)
+
+    Parameters
+    ----------
+    gps_speed_noise:
+        GPS speed measurement noise std dev (m/s).  Default 0.3 m/s (~1 km/h).
+    imu_accel_noise:
+        IMU acceleration process noise std dev (m/s²).  Default 0.15.
+    process_noise:
+        Base process noise for the velocity state.  Tune upward if the KF
+        lags rapid accelerations.
+    """
+    df = df.copy().sort_values("time").reset_index(drop=True)
+
+    imu_col = f"imu_{imu_axis}_dynamic_smooth_m_s2"
+    if imu_col not in df.columns:
+        # Fall back gracefully — just copy GPS speed
+        df["kf_speed_m_s"] = pd.to_numeric(df.get("gps_speed_m_s", df.get("speed_m_s", 0)), errors="coerce").fillna(0.0)
+        df["kf_speed_kph"] = df["kf_speed_m_s"] * 3.6
+        df["kf_accel_m_s2"] = 0.0
+        df["kf_dist_m"] = 0.0
+        df["kf_cumdist_m"] = 0.0
+        return df
+
+    gps_speed_arr  = pd.to_numeric(df.get("gps_speed_m_s", pd.Series(np.nan, index=df.index)), errors="coerce").to_numpy()
+    gps_time_arr   = df.get("gps_time", df["time"]).to_numpy()
+    imu_accel_arr  = (imu_axis_sign * pd.to_numeric(df[imu_col], errors="coerce").fillna(0.0)).to_numpy()
+    dt_arr         = pd.to_numeric(df["dt_s"], errors="coerce").fillna(0.0).clip(lower=0).to_numpy()
+
+    n = len(df)
+    kf_speed   = np.zeros(n)
+    kf_pos     = np.zeros(n)
+    kf_accel   = np.zeros(n)
+
+    # State: x = [pos, vel]; Covariance: P (2×2)
+    x = np.array([0.0, float(np.nanmedian(gps_speed_arr[:10]) if not np.all(np.isnan(gps_speed_arr[:10])) else 0.0)])
+    P = np.diag([1.0, 1.0])
+
+    R_gps  = gps_speed_noise ** 2       # GPS speed measurement noise
+    Q_base = process_noise ** 2          # base process noise
+    H_vel  = np.array([0.0, 1.0])         # we observe velocity only (1-D for dot product)
+
+    prev_gps_time = gps_time_arr[0]
+
+    for i in range(n):
+        dt = float(dt_arr[i])
+        a  = float(imu_accel_arr[i])
+
+        # Prediction step (F = [[1, dt], [0, 1]], B = [dt²/2, dt])
+        F = np.array([[1.0, dt], [0.0, 1.0]])
+        B = np.array([0.5 * dt * dt, dt])
+        x = F @ x + B * a
+        Q = np.array([
+            [Q_base * dt**4 / 4 + (imu_accel_noise * dt**2 / 2)**2,
+             Q_base * dt**3 / 2],
+            [Q_base * dt**3 / 2,
+             Q_base * dt**2 + imu_accel_noise**2 * dt**2],
+        ])
+        P = F @ P @ F.T + Q
+        x[1] = max(x[1], 0.0)   # speed can't go negative
+
+        # GPS update — only when GPS timestamp advanced (new GPS sample)
+        gps_t = gps_time_arr[i]
+        gps_v = gps_speed_arr[i]
+        if (not np.isnan(gps_v)) and (gps_t != prev_gps_time or i == 0):
+            y = gps_v - float(np.dot(H_vel, x))
+            S = float(H_vel @ P @ H_vel) + R_gps
+            K = (P @ H_vel) / S               # Kalman gain (2,)
+            x = x + K * y
+            P = (np.eye(2) - np.outer(K, H_vel)) @ P
+            x[1] = max(x[1], 0.0)
+            prev_gps_time = gps_t
+
+        kf_pos[i]   = x[0]
+        kf_speed[i] = x[1]
+        kf_accel[i] = a   # keep IMU accel for reference; smooth further below
+
+    # Smooth the KF-derived acceleration with a short median window
+    window = max(3, _window_samples(df, 2.0))
+    kf_accel_smooth = (
+        pd.Series(kf_accel)
+        .rolling(window=window, min_periods=1, center=True)
+        .median()
+        .to_numpy()
+    )
+
+    kf_dist = np.zeros(n)
+    kf_dist[1:] = np.abs(kf_speed[1:]) * dt_arr[1:]  # dist = v * dt
+
+    df["kf_speed_m_s"]  = kf_speed
+    df["kf_speed_kph"]  = kf_speed * 3.6
+    df["kf_accel_m_s2"] = kf_accel_smooth
+    df["kf_dist_m"]     = kf_dist
+    df["kf_cumdist_m"]  = kf_dist.cumsum()
+    return df
+
+
+def reindex_to_distance(
+    df: pd.DataFrame,
+    *,
+    dist_col: str = "kf_cumdist_m",
+    step_m: float = 1.0,
+    interp_cols: "list[str] | None" = None,
+) -> pd.DataFrame:
+    """Re-index a lap DataFrame from the time domain to a uniform distance grid.
+
+    Method
+    ------
+    * Build a uniform grid ``[0, step_m, 2*step_m, …, lap_total_dist_m]``.
+    * Linearly interpolate every numeric sensor/derived column onto that grid.
+    * Non-numeric columns (e.g. string labels) are forward-filled.
+
+    Parameters
+    ----------
+    df:
+        Merged, derived lap DataFrame (output of ``derive_motion_energy`` +
+        ``apply_kalman_filter``).  Must contain ``dist_col``.
+    dist_col:
+        The cumulative-distance column to use as the new x-axis.  Defaults
+        to ``"kf_cumdist_m"`` (Kalman-fused); falls back to
+        ``"cumdist_m"`` if the KF column is absent.
+    step_m:
+        Uniform grid spacing in metres.  1 m gives ~lap_length rows per lap
+        (a few thousand rows) which is fine for plotting and comparison.
+    interp_cols:
+        Explicit list of columns to interpolate.  ``None`` (default) means
+        all numeric columns except ``timestamp_ms`` and index-like columns.
+
+    Returns
+    -------
+    pd.DataFrame on a uniform distance grid with ``dist_m_grid`` as the
+    index column.
+    """
+    if dist_col not in df.columns:
+        dist_col = "cumdist_m" if "cumdist_m" in df.columns else None
+    if dist_col is None:
+        raise ValueError("No cumulative distance column found. Run derive_motion_energy first.")
+
+    df = df.copy().sort_values(dist_col).reset_index(drop=True)
+
+    x_raw = pd.to_numeric(df[dist_col], errors="coerce").ffill().fillna(0.0).to_numpy()
+    # Ensure monotone (small GPS jitter can produce tiny back-steps)
+    for i in range(1, len(x_raw)):
+        if x_raw[i] < x_raw[i - 1]:
+            x_raw[i] = x_raw[i - 1]
+
+    total_dist = float(x_raw[-1])
+    if total_dist <= 0:
+        raise ValueError("Cumulative distance is zero — cannot reindex.")
+
+    x_grid = np.arange(0.0, total_dist + step_m * 0.5, step_m)
+
+    # Decide which columns to interpolate
+    skip = {"timestamp_ms", dist_col, "lap", "sector"}
+    if interp_cols is None:
+        interp_cols = [
+            c for c in df.columns
+            if c not in skip and pd.api.types.is_numeric_dtype(df[c])
+        ]
+
+    out = pd.DataFrame({"dist_m_grid": x_grid})
+    for col in interp_cols:
+        y_raw = pd.to_numeric(df[col], errors="coerce").to_numpy()
+        # Fill internal NaN before interpolating
+        valid = ~np.isnan(y_raw)
+        if valid.sum() < 2:
+            out[col] = np.nan
+            continue
+        out[col] = np.interp(x_grid, x_raw[valid], y_raw[valid])
+
+    # Forward-fill string/categorical columns
+    for col in df.columns:
+        if col not in out.columns and col != dist_col:
+            try:
+                out[col] = np.interp(x_grid, x_raw, df[col].ffill().bfill().to_numpy(dtype=float))
+            except (ValueError, TypeError):
+                pass  # skip non-numeric non-interp-able columns
+
+    return out
+
+
+def compute_energy(
+    df: pd.DataFrame,
+    *,
+    use_kf_speed: bool = True,
+) -> pd.DataFrame:
+    """Compute instantaneous and cumulative energy, optionally using KF speed.
+
+    Adds or updates
+    ---------------
+    ``power_w``             — V * I  (unchanged from derive_motion_energy)
+    ``energy_j``            — power_w * dt_s  (per-row Joules)
+    ``energy_wh``           — energy_j / 3600  (per-row Wh)
+    ``cum_energy_j``        — cumulative Joules from lap start haha cum
+    ``cum_energy_wh``       — cumulative Wh from lap start haha haha cum
+    ``efficiency_wh_per_km``— instantaneous efficiency in Wh/km, computed
+                              from ``kf_dist_m`` if ``use_kf_speed`` is True,
+                              else from ``dist_m``.  A rolling 5-sample median
+                              is applied to reduce per-row noise.
+
+    Parameters
+    ----------
+    use_kf_speed:
+        If True and ``kf_dist_m`` is present, use KF distance for efficiency
+        calculation.  The Kalman-fused distance is more stable than raw GPS
+        distance when GPS samples are sparse.
+    """
+    df = df.copy()
+
+    current = pd.to_numeric(df["current_mA"], errors="coerce").abs()
+    voltage = pd.to_numeric(df["voltage_mV"], errors="coerce")
+    dt      = pd.to_numeric(df["dt_s"],       errors="coerce").fillna(0.0).clip(lower=0)
+
+    df["power_w"]    = (current / 1000.0) * (voltage / 1000.0)
+    df["energy_j"]   = df["power_w"] * dt
+    df["energy_wh"]  = df["energy_j"] / 3600.0
+    df["cum_energy_j"]  = df["energy_j"].cumsum() #haha cum
+    df["cum_energy_wh"] = df["energy_wh"].cumsum()
+
+    dist_col = "kf_dist_m" if (use_kf_speed and "kf_dist_m" in df.columns) else "dist_m"
+    dist_km = pd.to_numeric(df[dist_col], errors="coerce").fillna(0.0) / 1000.0
+    raw_eff = df["energy_wh"] / dist_km.replace(0, np.nan)
+    window = max(3, _window_samples(df, 5.0))
+    df["efficiency_wh_per_km"] = (
+        raw_eff.rolling(window=window, min_periods=1, center=True)
+        .median()
+        .replace([np.inf, -np.inf], np.nan)
+    )
+    return df
+
+
+
+# ---------------------------------------------------------------------------
 # Coordinate helpers
 # ---------------------------------------------------------------------------
+
+_EARTH_RADIUS_KM = 6371.0  # Mean Earth radius in km
+
+
+def haversine_distance(
+    lat1: "np.ndarray | pd.Series | float",
+    lon1: "np.ndarray | pd.Series | float",
+    lat2: "np.ndarray | pd.Series | float",
+    lon2: "np.ndarray | pd.Series | float",
+) -> "np.ndarray | float":
+    """Return the great-circle distance(s) in km between two GPS points.
+
+    Uses the Haversine formula, which is accurate to within ~0.5% for the
+    short inter-sample distances typical of a race track.
+
+    Parameters
+    ----------
+    lat1, lon1 : latitude / longitude of point 1 in decimal degrees.
+    lat2, lon2 : latitude / longitude of point 2 in decimal degrees.
+
+    Returns
+    -------
+    Distance in km (same shape as the inputs).
+    """
+    lat1_r = np.asarray(lat1, dtype=float) / 180.0 * np.pi
+    lat2_r = np.asarray(lat2, dtype=float) / 180.0 * np.pi
+    lon1_r = np.asarray(lon1, dtype=float) / 180.0 * np.pi
+    lon2_r = np.asarray(lon2, dtype=float) / 180.0 * np.pi
+
+    dlat = lat2_r - lat1_r
+    dlon = lon2_r - lon1_r
+
+    a = (
+        np.sin(dlat / 2) ** 2
+        + np.cos(lat1_r) * np.cos(lat2_r) * np.sin(dlon / 2) ** 2
+    )
+    return 2.0 * _EARTH_RADIUS_KM * np.arcsin(np.sqrt(a))
+
 
 def add_xy(df: pd.DataFrame) -> pd.DataFrame:
     """Add local flat-earth X/Y columns (metres) to a GPS DataFrame."""
@@ -130,11 +512,13 @@ def add_xy(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_distance(df: pd.DataFrame) -> float:
-    """Total track distance in metres using flat-earth XY."""
-    coords = add_xy(df)[["x", "y"]].to_numpy()
-    if len(coords) < 2:
+    """Total track distance in metres using the Haversine formula."""
+    if len(df) < 2:
         return 0.0
-    return float(np.linalg.norm(coords[1:] - coords[:-1], axis=1).sum())
+    lat = df["lat"].to_numpy(dtype=float)
+    lon = df["lon"].to_numpy(dtype=float)
+    seg_km = haversine_distance(lat[:-1], lon[:-1], lat[1:], lon[1:])
+    return float(seg_km.sum() * 1000.0)
 
 
 def add_gps_motion_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -150,10 +534,11 @@ def add_gps_motion_features(df: pd.DataFrame) -> pd.DataFrame:
     df["gps_time"] = times
     df["gps_dt_s"] = times.diff().dt.total_seconds().fillna(0.0).clip(lower=0)
 
-    xy = df[["x", "y"]].to_numpy()
-    seg = np.zeros(len(xy))
-    if len(xy) > 1:
-        seg[1:] = np.linalg.norm(xy[1:] - xy[:-1], axis=1)
+    lat = df["lat"].to_numpy(dtype=float)
+    lon = df["lon"].to_numpy(dtype=float)
+    seg = np.zeros(len(df))
+    if len(df) > 1:
+        seg[1:] = haversine_distance(lat[:-1], lon[:-1], lat[1:], lon[1:]) * 1000.0
     df["gps_dist_m"] = seg
     df["gps_cumdist_m"] = df["gps_dist_m"].cumsum()
     df["gps_speed_m_s_raw"] = np.where(
@@ -776,10 +1161,12 @@ def derive_motion_energy(
         smooth_window_s=accel_smooth_window_sec,
     )
 
-    # Point-to-point distance
-    xy = df[["x", "y"]].to_numpy()
-    seg = np.zeros(len(xy))
-    seg[1:] = np.linalg.norm(xy[1:] - xy[:-1], axis=1)
+    # Point-to-point distance via Haversine (great-circle, km → m)
+    lat = df["lat"].to_numpy(dtype=float)
+    lon = df["lon"].to_numpy(dtype=float)
+    seg = np.zeros(len(df))
+    if len(df) > 1:
+        seg[1:] = haversine_distance(lat[:-1], lon[:-1], lat[1:], lon[1:]) * 1000.0
     df["dist_m"] = seg
 
     # Elevation change

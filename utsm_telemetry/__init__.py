@@ -31,6 +31,10 @@ from .core import (
     compute_accel_candidate_scores,
     derive_motion_energy,
     build_laps,
+    clean_telemetry,
+    apply_kalman_filter,
+    reindex_to_distance,
+    compute_energy,
 )
 from .simulation import (
     ACTION_ACCELERATE,
@@ -77,6 +81,10 @@ __all__ = [
     "compute_accel_candidate_scores",
     "derive_motion_energy",
     "build_laps",
+    "clean_telemetry",
+    "apply_kalman_filter",
+    "reindex_to_distance",
+    "compute_energy",
     "ACTION_ACCELERATE",
     "ACTION_HOLD",
     "ACTION_COAST",

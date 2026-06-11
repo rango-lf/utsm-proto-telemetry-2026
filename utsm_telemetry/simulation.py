@@ -17,9 +17,12 @@ DEFAULT_MOTOR_PROFILE = {
     "top_speed_kph": 39.0,
     "wheel_diameter_m": 0.50,
     "vehicle_mass_kg": 100.0,
+    "driver_mass_kg": 50.0,
     "rolling_resistance_coeff": 0.008,
     "drivetrain_efficiency": 0.82,
-    "corner_drag_factor": 0.1,   # fraction of centripetal force treated as drag
+    "corner_drag_factor": 0.1,
+    "cd_area_m2": 0.07235,  # Drag coefficient × frontal area (CdA)
+    "air_density_kg_m3": 1.225,  
 }
 
 def build_full_run_distance(df: pd.DataFrame) -> pd.DataFrame:
@@ -41,18 +44,47 @@ def classify_strategy_action(delta_kph: float, hold_delta_kph: float = 1.0) -> s
 
 def build_motor_config(
     wheel_diameter_m: float = 0.50,
-    vehicle_mass_kg: float = 100.0,
+    vehicle_mass_kg: float = 50.0,
+    driver_mass_kg: float = 50.0,
     rolling_resistance_coeff: float = 0.008,
     drivetrain_efficiency: float = 0.82,
     corner_drag_factor: float = 0.1,
+    cd_area_m2: float = 0.07235,
+    air_density_kg_m3: float = 1.225,
 ) -> dict[str, float | str]:
+    """Build motor configuration with optional aerodynamic drag parameters.
+    
+    Parameters
+    ----------
+    wheel_diameter_m:
+        Wheel diameter in meters.
+    vehicle_mass_kg:
+        Vehicle structure mass (chassis, motor, electronics) in kg.
+    driver_mass_kg:
+        Driver mass in kg. Adds to total vehicle mass for resistance calculations.
+    rolling_resistance_coeff:
+        Rolling resistance coefficient (typically 0.005–0.010 for small vehicles).
+    drivetrain_efficiency:
+        Motor-to-wheel efficiency (motor electrical to mechanical at output).
+    corner_drag_factor:
+        Fraction of centripetal force treated as extra rolling resistance in turns.
+    cd_area_m2:
+        Aerodynamic drag parameter (CdA): Cd × frontal area in m².
+        Set to 0 to disable aerodynamic drag calculations.
+    air_density_kg_m3:
+        Air density (default 1.225 kg/m³ at sea level, ~1.184 at 500 m elevation).
+    """
     if wheel_diameter_m <= 0:
         raise ValueError("wheel_diameter_m must be positive.")
     if vehicle_mass_kg <= 0:
         raise ValueError("vehicle_mass_kg must be positive.")
+    if driver_mass_kg < 0:
+        raise ValueError("driver_mass_kg must be non-negative.")
+    
     config = dict(DEFAULT_MOTOR_PROFILE)
     config["wheel_diameter_m"] = float(wheel_diameter_m)
     config["vehicle_mass_kg"] = float(vehicle_mass_kg)
+    config["driver_mass_kg"] = float(driver_mass_kg)
     config["rolling_resistance_coeff"] = float(rolling_resistance_coeff)
     config["drivetrain_efficiency"] = float(drivetrain_efficiency)
     config["inferred_gear_ratio"] = infer_gear_ratio(
@@ -61,6 +93,8 @@ def build_motor_config(
         wheel_diameter_m=wheel_diameter_m,
     )
     config["corner_drag_factor"] = float(corner_drag_factor)
+    config["cd_area_m2"] = float(cd_area_m2)
+    config["air_density_kg_m3"] = float(air_density_kg_m3)
     return config
 
 
@@ -605,6 +639,12 @@ def build_strategy_report(
         f"Top speed cap: {float(motor_config.get('top_speed_kph', 0.0)):.1f} km/h",
         f"Assumed wheel diameter: {float(motor_config.get('wheel_diameter_m', 0.0)):.2f} m",
         f"Inferred gear ratio: {float(motor_config.get('inferred_gear_ratio', 0.0)):.2f}:1",
+        f"Vehicle mass: {float(motor_config.get('vehicle_mass_kg', 0.0)):.1f} kg",
+        f"Driver mass: {float(motor_config.get('driver_mass_kg', 0.0)):.1f} kg",
+        f"Total mass: {float(motor_config.get('vehicle_mass_kg', 0.0)) + float(motor_config.get('driver_mass_kg', 0.0)):.1f} kg",
+        f"Aerodynamic drag (CdA): {float(motor_config.get('cd_area_m2', 0.0)):.4f} m²",
+        f"Rolling resistance coefficient: {float(motor_config.get('rolling_resistance_coeff', 0.008)):.6f}",
+        f"Air density: {float(motor_config.get('air_density_kg_m3', 1.225)):.3f} kg/m³",
         f"Coast policy: 0 mA propulsion current",
     ]
     if calibration:
@@ -759,36 +799,66 @@ def _physics_propulsion_power_w(
     curvature_1_m: float = 0.0,
 ) -> float:
     """Estimate mechanical propulsive power in watts.
- 
+    
     Force components (all in Newtons):
-      F_roll  = m * g * Crr                        (rolling resistance)
-      F_slope = m * g * (grade_pct / 100)          (hill climb / descent)
-      F_accel = m * a                               (Newton's 2nd law)
-      F_corner = corner_drag_factor * m * v² * κ   (corner resistance)
- 
+      F_roll  = (m_vehicle + m_driver) * g * Crr   (rolling resistance)
+      F_slope = (m_vehicle + m_driver) * g * sin(θ) ≈ (m_vehicle + m_driver) * g * (grade_pct / 100)
+                                                     (hill climb / descent)
+      F_accel = (m_vehicle + m_driver) * a         (Newton's 2nd law)
+      F_drag  = 0.5 * ρ * CdA * v²                  (aerodynamic drag)
+      F_corner = corner_drag_factor * (m_vehicle + m_driver) * v² * κ
+                                                     (corner resistance via tire scrub)
+    
     Power = F_total * v / η  (η = drivetrain efficiency)
- 
-    F_corner uses a drag-factor approximation: the car doesn't consume
-    forward power equal to full centripetal force, but tyre scrub in
-    corners adds effective rolling resistance proportional to it.
-    The factor (default 0.1) can be calibrated from cornering coastdown
-    data if available.
+    
+    Notes
+    -----
+    - Driver mass is included in total mass for resistance calculations.
+    - Aerodynamic drag is enabled if cd_area_m2 > 0; otherwise it is disabled.
+    - The drag force is velocity-squared, making it significant at higher speeds.
+    - Corner drag uses a dimensionless factor (default 0.1) that approximates
+      effective rolling resistance from tire scrub during cornering.
+    - Air density defaults to sea level (1.225 kg/m³) but can be adjusted for
+      altitude or weather variations.
     """
     if motor_config is None:
         return 0.0
+    
     speed_m_s = max(speed_kph / 3.6, 0.0)
-    mass_kg = float(motor_config.get("vehicle_mass_kg", 100.0))
+    vehicle_mass_kg = float(motor_config.get("vehicle_mass_kg", 100.0))
+    driver_mass_kg = float(motor_config.get("driver_mass_kg", 0.0))
+    total_mass_kg = vehicle_mass_kg + driver_mass_kg
+    
     crr = float(motor_config.get("rolling_resistance_coeff", 0.008))
     efficiency = max(float(motor_config.get("drivetrain_efficiency", 0.82)), 0.05)
     corner_drag_factor = float(motor_config.get("corner_drag_factor", 0.1))
- 
-    rolling_force = mass_kg * 9.80665 * crr
-    grade_force = mass_kg * 9.80665 * (grade_pct / 100.0)
-    accel_force = mass_kg * max(accel_m_s2, 0.0)
-    # Centripetal: F = m*v²*κ, scaled by drag factor
-    corner_force = corner_drag_factor * mass_kg * (speed_m_s ** 2) * max(curvature_1_m, 0.0)
- 
-    propulsive_force = max(rolling_force + grade_force + accel_force + corner_force, 0.0)
+    cd_area_m2 = float(motor_config.get("cd_area_m2", 0.0))
+    air_density_kg_m3 = float(motor_config.get("air_density_kg_m3", 1.225))
+    
+    # Rolling resistance: proportional to normal force (weight)
+    rolling_force = total_mass_kg * 9.80665 * crr
+    
+    # Grade resistance: component of weight along slope
+    grade_force = total_mass_kg * 9.80665 * (grade_pct / 100.0)
+    
+    # Acceleration force: F = m * a (only positive acceleration counts)
+    accel_force = total_mass_kg * max(accel_m_s2, 0.0)
+    
+    # Aerodynamic drag: F_drag = 0.5 * ρ * CdA * v²
+    # Only included if cd_area_m2 > 0 (allows disabling for calibration/testing)
+    if cd_area_m2 > 0:
+        aero_drag_force = 0.5 * air_density_kg_m3 * cd_area_m2 * (speed_m_s ** 2)
+    else:
+        aero_drag_force = 0.0
+    
+    # Corner drag: effective resistance from tire scrub in turns
+    # F_corner = corner_drag_factor * m * v² * κ
+    corner_force = corner_drag_factor * total_mass_kg * (speed_m_s ** 2) * max(curvature_1_m, 0.0)
+    
+    # Total propulsive force (only positive, so we overcome all resistances)
+    propulsive_force = max(rolling_force + grade_force + accel_force + aero_drag_force + corner_force, 0.0)
+    
+    # Power = Force × Velocity / Efficiency
     return float(propulsive_force * speed_m_s / efficiency)
 
 
